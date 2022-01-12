@@ -1,0 +1,230 @@
+\documentclass[times, twoside, watermark]{zHenriquesLab-StyleBioRxiv}
+\usepackage{blindtext}
+\usepackage{url}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+%\setlength{\parindent}{1em}
+\setlength{\parskip}{0.3em} %This can be uncommnted if there is need to put a space after paragrah
+
+% Please give the surname of the lead author for the running footer
+% TODO: Put lead author names.
+\leadauthor{} 
+
+\begin{document}
+
+\title{Gnoma: Interactive troubleshooting at scale}
+\shorttitle{My Template}
+
+% Use letters for affiliations, numbers to show equal authorship (if applicable) and to indicate the corresponding author
+%\author{Dhayanithi Subramanian}
+%\author{Debraj Manna}
+
+%\affil{vRealize Network Insight(vRNI), CMBU}
+
+\maketitle
+
+%TC:break Abstract
+%the command above serves to have a word count for the abstract
+\begin{abstract}
+Troubleshooting applications for network related issues is a complex task in typical data center with tens of thousands of entities and millions of network flows. This becomes even harder when it needs to be done real time in an interactive fashion. The problem is hard at multiple dimensions. First typical metrics in a datacenter setup is always noisy with many short term anomalies, so there is a great deal of false positives in any setup. Avoiding these means looking at metrics in a bigger timerange in the past to learn about which are true anomalies. But this increases the scope of the interactive workload and doesn't scale.
+
+This paper introduces Gnoma, a system for interactive troubleshooting. Gnoma includes a graph based DSL modelling the problem domain. We also present a way to reduce the work done interactively by precomputing anomaly scores for all metrics of interest and propagating the anomaly scores through the dependency graph to other entities by combining them. To do this at interactive speed in really large graphs, we present the computation using a Bulk Synchronous Parallel approach. Finally, we present some experiments and discuss the results.
+
+\end {abstract}
+%TC:break main
+%the command above serves to have a word count for the abstract
+
+\begin{keywords}
+graph | anomaly | rca | troubleshooting | anomaly score
+\end{keywords}
+
+%\begin{corrauthor}
+%%\texttt{dhayanithis{@}vmware.com}
+%dhayanithis\at vmware.com
+%\end{corrauthor}
+
+\section*{Introduction}
+Data centers have thousands of metrics that are typically constantly monitored. These metrics span both the physical entities(hosts, switches, firewalls and other devices) and virtual(e.g vms). Higher level constructs like application tiers and applications are typically monitored for discrepancies as well. The monitoring tools typically also alert on anomalies. Often, an anomaly alert on an entity is just a symptom of some other underlying problem. In these cases, the network operators and application owners need additional information for identifying the root cause of the anomaly.
+
+Let's take a scenario explained in figure \ref{fig:anomaly} as an example. We have an application tier(Tier1) on which an alert was triggered for increased latency. In this scenario, the root cause is actually on a VM(VM6) which is causing heavy disk usage affecting VM5 sharing the same host. This kind of scenarios illustrates that anomalies on a app entity can occur due to other entities that are unrelated to the application. Any automated RCA framework thus has a burden to consider the whole of the data center graph since any entity in the connected component could lead to the issue. Further, it is not sufficient to say that there is a problem in VM6 as a root cause explanation. The user has to see how the full dependency chain of how it affects the application tier 1.
+
+\begin{figure}%[tbhp]
+\centering
+\includegraphics[width=.8\linewidth]{Figures/RCA}
+\caption{An example scenario of an anomaly occurring in VM6 leading to anomaly in VM5 since they are co-hosted on the same host. This affects Tier1 metrics via dependency chain Tier3 and Tier4. In this case, App1 is talking to another application App2.}
+\label{fig:anomaly}
+\end{figure}
+
+
+This means that the user should be able to analyse the problem at varying scales and should be able to zoom-in and zoom-out as required. In this case, the user might start with the affected tier, go to the affected vm and see why that vm is affected and eventually end up in the root cause. Guided troubleshooting work-flow tools provide ways to do this. They let the operator create a troubleshooting session that starts at the alert and provide a way to drill down to the root cause systematically. These sessions are typically started after the anomaly has occurred. Given a time window of a few hours around the time in which the trouble occurred, the operator would like to understand the root cause event within that time window that caused the problem at hand. In vRNI, we have been working on one such troubleshooting work-flow tool.
+
+One of the challenges in building the troubleshooting tool is the interactive nature of it which poses challenging scale and latency problems when we consider there are millions of entities that needs monitoring and tens of millions of time-series to analyse for anomalies and RCA in the full data center graph. Most importantly, looking at a short time window is not sufficient to determine anomalies. We need to look at long period of historic data to know the underlying distribution of metrics to identify anomalous behaviour. Also entities can have several time series, and the root cause could be any of them. 
+
+To avoid overwhelming themselves with alerts, users typically create alerts on high level kpis for entities that are important. Some of these alerts could be on metrics derived from other metrics projected to the higher level. In the above example, the user could have set an alert on the throughput of a tier. A tier is logical entity and its throughput is derived from the vms contained in it. To give the experience of analysing the problem at various scales and to allow the user to zoom-in to the root cause from a higher level problem, we need a way to propagate the low-level anomaly of any single metric on any entity up the dependency chain.
+
+There is a need for all of the following to work together:
+
+\begin{enumerate}
+  \item We need a system for analysing all the metric time series to determine when anomalies occur and notify the user. i.e, there needs to be an alerting infrastructure in the first place where the user can monitor high level KPIs. vRNI already has an alerting infrastructure that does this.
+  \item When an anomaly occurs and the user is interested in determining the root cause, we need a way to point to possible root causes efficiently.
+  \item The experience should be one of being able to zoom-in to issues starting at a alert on a high level entity/kpi
+\end{enumerate}
+In this paper, we are largely going to be looking at step 2 and 3, but using step 1 for pre-computing a few things that will make 2 easier and effective.
+
+Concretely, we evaluate the following ideas to make interactive troubleshooting at scale tractable:
+\begin{itemize}[noitemsep]
+  \item Instead of troubleshooting with just raw metrics, pre-compute anomaly scores for the raw metrics and use them during the interactive session
+  \item Use a graph database and a graph based DSL for capturing dependencies and modelling time.
+  \item Use the pre-computed anomaly scores at real time to drill down to actual anomalies using Bulk Synchronous Processing(BSP)\cite{BSP} on the graph model of the domain.	
+\end{itemize}
+
+\section*{Anomaly Scores}
+Anomalies for a given time series are decided by first predicting $x_t$ from history and then comparing the predicted value from the ground truth. Let $f(x_t)$ be the function to predict the value for time $t$. In this paper, we will treat the prediction function $f$ as a black box. Any number of models can be used here, from simple exponential smoothing, fourier methods, ARIMA variants or models based on neural networks. Our goal is not to do long term forecasts but only do a point prediction for $x_t$ based on history to be able to compute anomaly scores and evaluate if there was an anomaly. The prediction model $f$ needs to be updated at real time or frequently since systems can change their statistics dynamically based on say software updates or other events in the data center.
+
+To decide if the point value is anomalous we use the probabilistic approach outlined in Ahmad and Purdy from Numenta\cite{ahmadpurdy}. Here's a brief overview of the decision rule based on the one described in \cite{ahmadpurdy}. The decision rule first requires the computation of a raw anomaly score between the inference value and the ground truth. The raw anomaly score is given by 
+$$s_t =| f(x_t) - a_t | $$
+where $f(x_t)$ is the prediction at time $t$ and $a_t$ is the ground truth
+
+This gives an instantaneous measure of predictability, but if the underlying system is inherently noisy and unpredictable, the change in predictability is a better indicator of the anomalous behavior. The difference between the short term and the long term means of the raw anomaly scores indicates the change in predictability. 
+
+The final anomaly score gives the probability that the value is anomalous and is given by the complement of the tail probability Q\cite{tailprob}.
+\begin{equation}
+L_t = 1 - Q(\frac{\tilde{\mu_t} - \mu_t}{\sigma_t})
+\end{equation}
+
+where $\tilde{\mu_t}$ is the rolling mean of the last $W'$ raw scores and $\mu_t$ is the rolling mean of last $W$ anomaly scores where $W' << W$. Anomaly is detected when 
+\begin{equation}
+L_t >= 1 - \epsilon
+\end{equation}
+
+
+Other decision rules are possible and an ensemble approach where the final decision is an intersection of multiple decision rule is even better to reduce the false positive rate. 
+
+\subsection*{Combining Anomaly Scores}
+Most entities (e.g VM) have multiple metrics capturing utilization of cpu, network, disk, memory etc. During interactive troubleshooting, it will help to zoom out and get a view of the anomaly status of an entity from its corresponding metrics. Section 3.3 of \cite{ahmadpurdy} provides a way of computing a global measure from individual models. We can use the same for combining multiple anomaly scores of various metrics within the entity to a single anomaly score for the entity. A simple measure assumes the metric behaviour for an entity are independent to compute the overall score as 
+
+\begin{equation}
+L_t = 1 - \prod_{i = 1}^{M} Q(\frac{\tilde{\mu_t} - \mu_t}{\sigma_t})
+\end{equation}
+
+where $M$ is the number of models/metrics. The paper also defines a windowing mechanism that allows the system to incorporate spikes in likelihood that are close in time but not exactly coincident which is also relevant and useful in our case.
+
+\subsection*{Grouped Anomaly Scores}
+Sometimes we want to calculate the anomaly score of a logical entity which represents a grouping of multiple other entities(both physical and logical). An example would be to calculate the anomaly scores at the tier level based on the anomalies of the endpoints within the tier.
+
+Equation 2 will not work if the number of contained entities is large. We take a weighted mean of the underlying anomaly scores where the weights are used to capture the differences in the underlying entities. An anomaly of a tier with uneven distribution of traffic, will be more if it the problems happens in the entity that takes the maximum traffic versus the entity that doesn't receive much traffic. There are several ways to define the weights, it could depend on a variety of metrics. We define the weights in terms of traffic rate of the underlying entities. To calculate the weights, we take the historic traffic distribution and use them as weights.
+
+\begin{equation}
+L_t = \frac{\Sigma w_i * L_t^i}{\Sigma w_i}
+\end{equation}
+
+
+\section*{Graph Modelling}
+Graphs are particularly useful to capture dependencies and relationships. The root cause of a network anomaly for an entity could be due to a problem in another entity. For e.g switch failures could show up application connectivity issues or latency issues. A failure can cause cascading failures that shows up in another entity at a later time. Graphs are generally used to to model the relations between entities and capture causal dependencies. 
+
+We will use gremlin \cite{gremlin} to describe the dependencies. Gremlin, which is part of the apache tinkerpop project\cite{tinkerpop} can express complex traversals and is also supported by the vast majority of graph databases. It's graph traversal mechanism is a natural way to describe causal dependencies. For e.g., a subset of the datacenter graph useful for capturing the scenario in figure \ref{fig:anomaly} is shown in figure \ref{fig:schema}. We will model entities like Hosts, VMs, Switches, Routers etc like vertices. Higher level logical vertices are used as a 'hub' to aggregate other vertices in a relationship. For example a an Application Tier is made up of VMs. An application is made of Tiers. Relations are modelled as edges. We use 'contains', 'talksTo' as relations. Network flows are modelled as vertices with edges describing the "src" and "dest" vertices for the flow. We will model time by simply including two vertex properties \textunderscore{\textit{startTime}}, \textunderscore{\textit{endTime}}
+
+A high level 'runbook' for debugging an application tier might look like 
+\begin{enumerate}
+  \item Which all tiers does this particular tier 'talk to'. Are there any anomalies on any of those tiers?
+  \item For every tier with anomaly, which endpoints making up the tier are anomalous?
+  \item Which flows associated with the endpoints in questions are anomalous?
+\end{enumerate}
+
+We could model these dependencies directly in gremlin. The metrics associated with the each of the above dependency can be described in gremlin in the same order as below. 
+
+\begin{lstlisting}
+g.V().has("tier", "name", "Tier1")
+	.out("talksTo")
+	.metrics
+g.V().has("tier", "name", "Tier1")
+	.out("talksTo")
+	.out("contains")
+	.metrics
+g.V().hasLabel("flow").as("f")
+	.union(out("src"), out("dest"))
+	.in("contains")
+	.has("name", "Tier1")
+	.select("f")
+	.metrics
+\end{lstlisting}	
+
+Given a list of dependencies starting at an entity, we can compute anomaly scores by walking up the dependency graph from lower most level. For e.g, an application tier's anomaly score can be computed based on
+\begin{enumerate}
+\item The anomaly score of the vms in the tier. This is itself will be based on the anomaly score of the various metrics associated with the vm as pointed out in the Combining Anomaly Scores section.
+\item The tier's of other applications that this tier talks to.
+\item The anomaly score at the tier level is taken as the max of its own anomaly computed by the metrics present in the tier level and the anomaly score of all the endpoints as part of the tier. 
+\end{enumerate}
+
+In this way, the anomaly score computation proceeds up the dependency tree till it reaches the originating vertex from which the troubleshooting was triggered. In Bulk Synchronous Parallel processing, all the same vertices run the same program steps and as the computation proceeds the results converge by message passing between the vertices. The pseudo code for the kind of computation that will be performed by each vertex is shown in algorithm listing 1. Note that there can be multiple dependencies and dependency trees. The final anomaly scores are calculated after propagating the scores through these multiple paths.
+
+\begin{algorithm*}
+\caption{Vertex program for anomaly score propagation} 
+\begin{verbatim}
+evaluateStep(vertex, messenger, traversal):
+  if not set vertex.property("anomScore")
+    vertex.set_property("anomScore", combinedScore(vertex.metrics)) // equation 3
+  scores = messenger.receiveMessages()
+  if (!scores.isNotEmpty())
+    total_score = total_weight = 0.0f
+    for weight, score in scores:
+      total_score += score
+      total_weight += weight
+    weighted_score = total_score / total_score // equation 4
+    new_anom_score = max(vertex.value("anomScore"), weighted_score)
+    vertex.set_property("anomScore", new_anom_score)
+    messenger.sendMessages(parent(vertex, traversal), new_anom_score)
+\end{verbatim}    
+\end{algorithm*}
+
+
+\begin{figure}%[tbhp]
+\centering
+\includegraphics[width=.8\linewidth]{Figures/Schema}
+\caption{The property graph model for the scenario described in Figure 1. The vertices has properties 'metrics', which lists all the metric names that are available at a given vertex.}
+\label{fig:schema}
+\end{figure}
+
+Since graph databases are not ideal for storing millions of time series, we use a separate time series DB for storing metrics. For the purposes of troubleshooting the entire history of metrics is not required. We need the anomaly scores of the time window of the troubleshooting session. These can be fetched from the metric DB and loaded into the graph as part of the BSP computation in the graph.
+	
+\section*{Evaluation and Discussion}
+Our main computation as specified by the listing under Algorithm 1 computes scores according to equations 3 and 4 in the dependency graph. As experiments we evaluate how meaningful these scores based on these equations under various scenarios. If these equations produce meaningful scores for various scenarios then the overall anomaly score based on the algorithm has to be meaningful and can be used for the purpose of troubleshooting.
+
+To have more control over the metrics and labelled anomalies, we created synthetic metrics for our experiments and simulated anomalies on them. Each time series has 7 days worth of metric points at 5 min granularity. We use simple exponential smoothing \cite{expsmoothing} as the prediction function $f$. In the first experiment, we created two different metrics for network rate and cpu utilization for a vm, calculated the anomaly scores and combined anomaly score for the vm. The network throughput anomaly catches the two spikes, but misses the level change. The cpu anomaly scores catches the single spike and the level change. The combined anomaly captures all the anomalies across the two metrics as show in figure \ref{fig:CombinedAnomaly}. In general, the combined anomaly doesn't miss anomalies, but sometimes can be overaggressive and result show more anomalies for a given threshold. This is desirable since higher anomaly scores for the individual time series co-occuring implies a higher probability of a problem at the entity level.
+
+\begin{figure}%[tbhp]
+\centering
+\includegraphics[width=.8\linewidth]{Figures/CombinedAnomaly}
+\caption{Top left is network throughput and bottom left is cpu utilization. There is is level change in the last part of the time series. The top graph show spikes in positions that were determined to be anomalous as per equation 2 with an epsilon value of 0.00001. The top most shows that the throughput anomaly spikes are captured as true anomalies, but the level change is missed. This is possibly due to the fact that our prediction function is simple exponential smoothing. The second figure on the right shows the anomaly captured for both the spike and level shift in the cpu metric. The third graph captures the anomaly captured on the combined scores as per equation 3. It shows all the anomalies across both the metrics are captured.}
+\label{fig:CombinedAnomaly}
+\end{figure}
+
+\begin{figure}%[tbhp]
+\centering
+\includegraphics[width=.8\linewidth]{Figures/WeightedAnomaly}
+\caption{The top figure shows the cpu utilization of 10 vms in a tier, with one outlier vm with low cpu utilization. The bottom first figure shows weighted anomaly of all the normal vms. It shows the weighed anomaly captures the first anomalous spike but not the second, since the second is close enough to the first, that is not considered anomalous. The second figure shows the anomaly of the outlier vm. It shows three spikes are captured as anomalous. The weighted score of all the 10 vms does not capture the extra anomalies in the outlier vm because the outlier vm has lower weight compared to the others. In this example the weights are taken from historic cpu utilization values of these vms.}
+\label{fig:WeightedAnomaly}
+\end{figure}
+
+To demonstrate combining anomaly scores across entities using weighted anomaly scores, we simulate a tier with 10 vms, the cpu utilization of 1 of the vms were much lower than the rest. In figure \ref{fig:WeightedAnomaly} we show that the weighted anomaly score of the normal vms shows an anomaly. The outlier vm has extra anomalies that shows up when evaluated on the outlier vm metric by itself. But if we calculate the weighted anomaly of the entire group the extra outlier anomalies don't show up. Taking a weighted anomaly lowers the anomaly score at the grouping entity. This is in contrast to the other combined anomaly discussed above. Other options are possible here, instead of taking the weighted average, one can think of taking the anomaly score of the vm with $max(normalizedWeight * vmAnomalyScore)$ and projecting it at the tier essentially modelling the worst case behaviour of the vm to the tier. This choice could be controlled by a user sensitivity setting that can be toggled by the user during interactive debugging, depending on if they want to see more anomalous entities or less.
+
+We implemented a simplified model of the troubleshooting process using in memory JanusGraph using a vertex program to model the BSP. When the subgraph required for computing is small and constrained by the starting point, an OLTP approach may be faster than an OLAP based on BSP. 
+ 
+\section*{Conclusions}
+Automated fault detection of higher level KPIs and guided troubleshooting based on dependency information for drilling down to the root cause is extremely useful for bringing down the MTTD and MTTR of application issues in data center. To do this at data center scale interactively is a challenge for approaches that rely only on metrics of the entities. In this paper, we introduced Gnoma, a system for troubleshooting that uses precomputed anomaly scores to compute other anomaly scores at various levels in dependency graph. This will be useful during a troubleshooting session as the anomaly scores of the dependencies can guide the user in drilling down to the root cause.
+
+
+\section*{Bibliography}
+\bibliography{zHenriquesLab_Bib}
+
+%% You can use these special %TC: tags to ignore certain parts of the text.
+%TC:ignore
+%the command above ignores this section for word count
+
+%TC:endignore
+%the command above ignores this section for word count
+
+\end{document}
